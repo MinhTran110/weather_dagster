@@ -172,6 +172,23 @@ def cleaned_weather(context: AssetExecutionContext, duckdb: DuckDBResource) -> M
 
         total_cleaned_rows = conn.execute("SELECT COUNT(*) FROM cleaned_weather;").fetchone()[0]
 
+        sample_cleaned = conn.execute(
+            """
+            SELECT timestamp, temperature_2m, relative_humidity_2m, precipitation, wind_speed_10m
+            FROM cleaned_weather
+            ORDER BY timestamp
+            LIMIT 5;
+            """
+        ).fetchall()
+
+        md_cleaned = [
+            "| Giờ (Timestamp) | Nhiệt độ (°C) | Độ ẩm (%) | Lượng mưa (mm) | Tốc độ gió (km/h) |",
+            "|:---:|:---:|:---:|:---:|:---:|",
+        ]
+        for r in sample_cleaned:
+            md_cleaned.append(f"| {r[0]} | {r[1]} | {r[2]} | {r[3]} | {r[4]} |")
+        cleaned_preview_md = "\n".join(md_cleaned)
+
     context.log.info(f"Cleaned weather updated for {loc_name}. Total records in DB: {total_cleaned_rows}")
     return MaterializeResult(
         metadata={
@@ -179,6 +196,7 @@ def cleaned_weather(context: AssetExecutionContext, duckdb: DuckDBResource) -> M
             "processed_records": MetadataValue.int(len(cleaned_records)),
             "total_records": MetadataValue.int(total_cleaned_rows),
             "dagster_run_id": MetadataValue.text(context.run.run_id or "manual"),
+            "hourly_preview": MetadataValue.md(cleaned_preview_md),
         }
     )
 
@@ -245,10 +263,28 @@ def daily_weather_summary(context: AssetExecutionContext, duckdb: DuckDBResource
 
         total_days = conn.execute("SELECT COUNT(*) FROM daily_weather_summary;").fetchone()[0]
 
+        summary_sample = conn.execute(
+            """
+            SELECT date, min_temperature, max_temperature, avg_temperature, total_precipitation, avg_wind_speed
+            FROM daily_weather_summary
+            ORDER BY date
+            LIMIT 7;
+            """
+        ).fetchall()
+
+        md_summary = [
+            "| Ngày | Min (°C) | Max (°C) | Trung bình (°C) | Lượng mưa (mm) | Gió (km/h) |",
+            "|:---:|:---:|:---:|:---:|:---:|:---:|",
+        ]
+        for r in summary_sample:
+            md_summary.append(f"| {r[0]} | {r[1]} | {r[2]} | {r[3]} | {r[4]} | {r[5]} |")
+        forecast_preview_md = "\n".join(md_summary)
+
     context.log.info(f"Daily weather mart updated. Total summary days: {total_days}")
     return MaterializeResult(
         metadata={
             "total_days_summarized": MetadataValue.int(total_days),
             "dagster_run_id": MetadataValue.text(context.run.run_id or "manual"),
+            "forecast_preview": MetadataValue.md(forecast_preview_md),
         }
     )
