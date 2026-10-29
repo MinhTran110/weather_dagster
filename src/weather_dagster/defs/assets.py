@@ -1,6 +1,7 @@
-"""Dagster 3-tier assets: raw -> cleaned -> marts for weather data."""
+"""Dagster 3-tier assets: raw -> cleaned -> marts with enterprise auditability."""
 
 import json
+import uuid
 from datetime import datetime, timezone
 from dagster import AssetExecutionContext, MaterializeResult, MetadataValue, asset
 from dagster_duckdb import DuckDBResource
@@ -8,38 +9,65 @@ from dagster_duckdb import DuckDBResource
 from weather_dagster.defs.client import OpenMeteoClient
 
 
+DEFAULT_LOCATION = "Hanoi"
+DEFAULT_LAT = 21.0285
+DEFAULT_LON = 105.8542
+DATA_SOURCE = "open-meteo"
+
+
 @asset(
     group_name="raw",
-    description="Raw JSON forecast data fetched from Open-Meteo REST API and stored in DuckDB.",
+    description="Raw JSON forecast data from Open-Meteo with full audit trail and run lineage.",
 )
 def raw_weather(context: AssetExecutionContext, duckdb: DuckDBResource) -> MaterializeResult:
     """Fetch raw weather data from Open-Meteo API and store in DuckDB raw_weather table."""
     client = OpenMeteoClient()
-    context.log.info("Fetching weather data from Open-Meteo API...")
-    payload = client.fetch_weather()
+    context.log.info(f"Fetching weather data from Open-Meteo for {DEFAULT_LOCATION}...")
+    payload = client.fetch_weather(latitude=DEFAULT_LAT, longitude=DEFAULT_LON)
+
+    now = datetime.now(timezone.utc)
+    batch_id = str(uuid.uuid4())
 
     with duckdb.get_connection() as conn:
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS raw_weather (
-                ingested_at TIMESTAMP,
+                raw_id VARCHAR PRIMARY KEY,
+                source VARCHAR,
+                location_name VARCHAR,
+                latitude DOUBLE,
+                longitude DOUBLE,
+                dagster_run_id VARCHAR,
+                created_at TIMESTAMP,
                 payload VARCHAR
             );
             """
         )
         conn.execute(
-            "INSERT INTO raw_weather VALUES (?, ?);",
-            [datetime.now(timezone.utc), json.dumps(payload)],
+            """
+            INSERT INTO raw_weather VALUES (?, ?, ?, ?, ?, ?, ?, ?);
+            """,
+            [
+                batch_id,
+                DATA_SOURCE,
+                DEFAULT_LOCATION,
+                payload.get("latitude", DEFAULT_LAT),
+                payload.get("longitude", DEFAULT_LON),
+                context.run.run_id,
+                now,
+                json.dumps(payload),
+            ],
         )
         total_batches = conn.execute("SELECT COUNT(*) FROM raw_weather;").fetchone()[0]
 
-    context.log.info(f"Raw weather data saved. Total raw batches: {total_batches}")
+    context.log.info(f"Raw weather batch {batch_id} saved. Total batches: {total_batches}")
     return MaterializeResult(
         metadata={
+            "raw_id": MetadataValue.text(batch_id),
+            "source": MetadataValue.text(DATA_SOURCE),
+            "location_name": MetadataValue.text(DEFAULT_LOCATION),
             "total_raw_batches": MetadataValue.int(total_batches),
-            "latitude": MetadataValue.float(payload.get("latitude", 0.0)),
-            "longitude": MetadataValue.float(payload.get("longitude", 0.0)),
-            "timezone": MetadataValue.text(payload.get("timezone", "UTC")),
+            "dagster_run_id": MetadataValue.text(context.run.run_id or "manual"),
         }
     )
 
@@ -47,20 +75,28 @@ def raw_weather(context: AssetExecutionContext, duckdb: DuckDBResource) -> Mater
 @asset(
     deps=[raw_weather],
     group_name="cleaned",
-    description="Cleaned, unnested hourly weather metrics with typed columns and deduplication.",
+    description="Cleaned, unnested hourly weather metrics with composite primary key, source, and audit timestamps.",
 )
 def cleaned_weather(context: AssetExecutionContext, duckdb: DuckDBResource) -> MaterializeResult:
-    """Parse and clean raw weather JSON into tabular cleaned_weather table."""
+    """Parse and clean raw weather JSON into tabular cleaned_weather with created_at and updated_at."""
+    now = datetime.now(timezone.utc)
+
     with duckdb.get_connection() as conn:
         # Retrieve the latest raw payload
         row = conn.execute(
-            "SELECT payload FROM raw_weather ORDER BY ingested_at DESC LIMIT 1;"
+            """
+            SELECT location_name, source, latitude, longitude, payload
+            FROM raw_weather
+            ORDER BY created_at DESC
+            LIMIT 1;
+            """
         ).fetchone()
 
         if not row:
             raise ValueError("No raw weather data found in raw_weather table.")
 
-        raw_data = json.loads(row[0])
+        loc_name, src, lat, lon, payload_str = row
+        raw_data = json.loads(payload_str)
         hourly = raw_data.get("hourly", {})
 
         times = hourly.get("time", [])
@@ -69,51 +105,80 @@ def cleaned_weather(context: AssetExecutionContext, duckdb: DuckDBResource) -> M
         precipitations = hourly.get("precipitation", [])
         wind_speeds = hourly.get("wind_speed_10m", [])
 
-        # Create cleaned table
+        # Create cleaned table with composite primary key: (location_name, timestamp)
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS cleaned_weather (
-                timestamp TIMESTAMP PRIMARY KEY,
+                location_name VARCHAR,
+                timestamp TIMESTAMP,
                 temperature_2m DOUBLE,
                 relative_humidity_2m DOUBLE,
                 precipitation DOUBLE,
-                wind_speed_10m DOUBLE
+                wind_speed_10m DOUBLE,
+                source VARCHAR,
+                latitude DOUBLE,
+                longitude DOUBLE,
+                dagster_run_id VARCHAR,
+                created_at TIMESTAMP,
+                updated_at TIMESTAMP,
+                PRIMARY KEY (location_name, timestamp)
             );
             """
         )
 
-        # Transform and clean records
         cleaned_records = []
         for i in range(len(times)):
             t_str = times[i]
             if not t_str:
                 continue
-            # Parse ISO timestamp
             t_val = datetime.fromisoformat(t_str)
             temp = float(temperatures[i]) if i < len(temperatures) and temperatures[i] is not None else None
             hum = float(humidities[i]) if i < len(humidities) and humidities[i] is not None else None
             precip = float(precipitations[i]) if i < len(precipitations) and precipitations[i] is not None else 0.0
             wind = float(wind_speeds[i]) if i < len(wind_speeds) and wind_speeds[i] is not None else None
 
-            cleaned_records.append((t_val, temp, hum, precip, wind))
+            cleaned_records.append((
+                loc_name,
+                t_val,
+                temp,
+                hum,
+                precip,
+                wind,
+                src,
+                lat,
+                lon,
+                context.run.run_id,
+                now,  # created_at
+                now,  # updated_at
+            ))
 
-        # Upsert cleaned records
+        # Upsert with ON CONFLICT preserving original created_at
         conn.executemany(
             """
-            INSERT OR REPLACE INTO cleaned_weather (
-                timestamp, temperature_2m, relative_humidity_2m, precipitation, wind_speed_10m
-            ) VALUES (?, ?, ?, ?, ?);
+            INSERT INTO cleaned_weather (
+                location_name, timestamp, temperature_2m, relative_humidity_2m, precipitation,
+                wind_speed_10m, source, latitude, longitude, dagster_run_id, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT (location_name, timestamp) DO UPDATE SET
+                temperature_2m = EXCLUDED.temperature_2m,
+                relative_humidity_2m = EXCLUDED.relative_humidity_2m,
+                precipitation = EXCLUDED.precipitation,
+                wind_speed_10m = EXCLUDED.wind_speed_10m,
+                dagster_run_id = EXCLUDED.dagster_run_id,
+                updated_at = EXCLUDED.updated_at;
             """,
             cleaned_records,
         )
 
         total_cleaned_rows = conn.execute("SELECT COUNT(*) FROM cleaned_weather;").fetchone()[0]
 
-    context.log.info(f"Cleaned weather records updated. Total records in DB: {total_cleaned_rows}")
+    context.log.info(f"Cleaned weather updated for {loc_name}. Total records in DB: {total_cleaned_rows}")
     return MaterializeResult(
         metadata={
+            "location_name": MetadataValue.text(loc_name),
             "processed_records": MetadataValue.int(len(cleaned_records)),
             "total_records": MetadataValue.int(total_cleaned_rows),
+            "dagster_run_id": MetadataValue.text(context.run.run_id or "manual"),
         }
     )
 
@@ -121,40 +186,61 @@ def cleaned_weather(context: AssetExecutionContext, duckdb: DuckDBResource) -> M
 @asset(
     deps=[cleaned_weather],
     group_name="marts",
-    description="Aggregated daily weather mart with min/max/avg temperature, precipitation, and wind.",
+    description="Aggregated daily weather mart per location with audit timestamps and lineage.",
 )
 def daily_weather_summary(context: AssetExecutionContext, duckdb: DuckDBResource) -> MaterializeResult:
-    """Aggregate cleaned weather data into daily summary marts table."""
+    """Aggregate cleaned weather data into daily summary marts table with created_at and updated_at."""
+    now = datetime.now(timezone.utc)
+
     with duckdb.get_connection() as conn:
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS daily_weather_summary (
-                date DATE PRIMARY KEY,
+                location_name VARCHAR,
+                date DATE,
                 avg_temperature DOUBLE,
                 min_temperature DOUBLE,
                 max_temperature DOUBLE,
                 total_precipitation DOUBLE,
                 avg_wind_speed DOUBLE,
-                record_count BIGINT
+                record_count BIGINT,
+                dagster_run_id VARCHAR,
+                created_at TIMESTAMP,
+                updated_at TIMESTAMP,
+                PRIMARY KEY (location_name, date)
             );
             """
         )
 
+        # Temporary table or direct aggregation
         conn.execute(
             """
-            INSERT OR REPLACE INTO daily_weather_summary
+            INSERT INTO daily_weather_summary
             SELECT
+                location_name,
                 CAST(timestamp AS DATE) AS date,
                 ROUND(AVG(temperature_2m), 2) AS avg_temperature,
                 ROUND(MIN(temperature_2m), 2) AS min_temperature,
                 ROUND(MAX(temperature_2m), 2) AS max_temperature,
                 ROUND(SUM(precipitation), 2) AS total_precipitation,
                 ROUND(AVG(wind_speed_10m), 2) AS avg_wind_speed,
-                COUNT(*) AS record_count
+                COUNT(*) AS record_count,
+                ? AS dagster_run_id,
+                ? AS created_at,
+                ? AS updated_at
             FROM cleaned_weather
-            GROUP BY CAST(timestamp AS DATE)
-            ORDER BY date;
-            """
+            GROUP BY location_name, CAST(timestamp AS DATE)
+            ON CONFLICT (location_name, date) DO UPDATE SET
+                avg_temperature = EXCLUDED.avg_temperature,
+                min_temperature = EXCLUDED.min_temperature,
+                max_temperature = EXCLUDED.max_temperature,
+                total_precipitation = EXCLUDED.total_precipitation,
+                avg_wind_speed = EXCLUDED.avg_wind_speed,
+                record_count = EXCLUDED.record_count,
+                dagster_run_id = EXCLUDED.dagster_run_id,
+                updated_at = EXCLUDED.updated_at;
+            """,
+            [context.run.run_id, now, now],
         )
 
         total_days = conn.execute("SELECT COUNT(*) FROM daily_weather_summary;").fetchone()[0]
@@ -163,5 +249,6 @@ def daily_weather_summary(context: AssetExecutionContext, duckdb: DuckDBResource
     return MaterializeResult(
         metadata={
             "total_days_summarized": MetadataValue.int(total_days),
+            "dagster_run_id": MetadataValue.text(context.run.run_id or "manual"),
         }
     )

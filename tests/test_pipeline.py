@@ -102,20 +102,34 @@ def test_full_pipeline_materialization_and_checks(tmp_path):
         raw_count = conn.execute("SELECT COUNT(*) FROM raw_weather;").fetchone()[0]
         assert raw_count == 1
 
+        raw_row = conn.execute("SELECT source, location_name, created_at FROM raw_weather;").fetchone()
+        assert raw_row[0] == "open-meteo"
+        assert raw_row[1] == "Hanoi"
+        assert raw_row[2] is not None
+
         cleaned_count = conn.execute("SELECT COUNT(*) FROM cleaned_weather;").fetchone()[0]
         assert cleaned_count == 5
 
+        cleaned_row = conn.execute("SELECT location_name, source, created_at, updated_at FROM cleaned_weather LIMIT 1;").fetchone()
+        assert cleaned_row[0] == "Hanoi"
+        assert cleaned_row[1] == "open-meteo"
+        assert cleaned_row[2] is not None
+        assert cleaned_row[3] is not None
+
         summary_rows = conn.execute(
-            "SELECT date, min_temperature, max_temperature, total_precipitation, record_count FROM daily_weather_summary ORDER BY date;"
+            "SELECT location_name, date, min_temperature, max_temperature, total_precipitation, record_count, created_at, updated_at FROM daily_weather_summary ORDER BY date;"
         ).fetchall()
         assert len(summary_rows) == 2
 
         # 2026-10-29 aggregated metrics
         day1 = summary_rows[0]
-        assert day1[1] == 21.0  # min temp
-        assert day1[2] == 22.5  # max temp
-        assert day1[3] == 2.0   # total precip: 0.0 + 1.5 + 0.5
-        assert day1[4] == 3     # count
+        assert day1[0] == "Hanoi"
+        assert day1[2] == 21.0  # min temp
+        assert day1[3] == 22.5  # max temp
+        assert day1[4] == 2.0   # total precip: 0.0 + 1.5 + 0.5
+        assert day1[5] == 3     # count
+        assert day1[6] is not None  # created_at
+        assert day1[7] is not None  # updated_at
 
     # Run asset checks directly against the populated test database
     cleaned_check_result = check_cleaned_weather_ranges(duckdb=test_duckdb)
