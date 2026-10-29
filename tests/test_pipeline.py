@@ -93,6 +93,7 @@ def test_full_pipeline_materialization_and_checks(tmp_path):
         result = materialize(
             assets=[raw_weather, cleaned_weather, daily_weather_summary],
             resources={"duckdb": test_duckdb},
+            partition_key="2026-10-29",
         )
 
         assert result.success
@@ -119,7 +120,7 @@ def test_full_pipeline_materialization_and_checks(tmp_path):
         summary_rows = conn.execute(
             "SELECT location_name, date, min_temperature, max_temperature, total_precipitation, record_count, created_at, updated_at FROM daily_weather_summary ORDER BY date;"
         ).fetchall()
-        assert len(summary_rows) == 2
+        assert len(summary_rows) == 1
 
         # 2026-10-29 aggregated metrics
         day1 = summary_rows[0]

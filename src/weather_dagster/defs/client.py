@@ -7,7 +7,8 @@ import requests
 class OpenMeteoClient:
     """Client for fetching weather data from Open-Meteo REST API."""
 
-    BASE_URL = "https://api.open-meteo.com/v1/forecast"
+    FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
+    ARCHIVE_URL = "https://archive-api.open-meteo.com/v1/archive"
 
     def __init__(self, timeout: int = 30, session: Optional[requests.Session] = None):
         self.timeout = timeout
@@ -19,9 +20,11 @@ class OpenMeteoClient:
         longitude: float = 105.8542,  # Hanoi longitude
         hourly: Optional[List[str]] = None,
         timezone: str = "auto",
-        forecast_days: int = 7,
+        forecast_days: Optional[int] = None,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Fetch weather forecast data from Open-Meteo API.
+        """Fetch weather data from Open-Meteo API for forecast or historical partitions.
 
         Args:
             latitude: Latitude of the location.
@@ -29,6 +32,8 @@ class OpenMeteoClient:
             hourly: List of hourly weather variables to request.
             timezone: Timezone string, defaults to "auto".
             forecast_days: Number of forecast days to retrieve (1-16).
+            start_date: Start date string in YYYY-MM-DD format (for partitions/backfills).
+            end_date: End date string in YYYY-MM-DD format (for partitions/backfills).
 
         Returns:
             Dict containing API response payload with hourly weather metrics.
@@ -49,9 +54,15 @@ class OpenMeteoClient:
             "longitude": longitude,
             "hourly": ",".join(hourly),
             "timezone": timezone,
-            "forecast_days": forecast_days,
         }
 
-        response = self.session.get(self.BASE_URL, params=params, timeout=self.timeout)
+        # If backfill / specific partition dates are requested
+        if start_date and end_date:
+            params["start_date"] = start_date
+            params["end_date"] = end_date
+        else:
+            params["forecast_days"] = forecast_days or 7
+
+        response = self.session.get(self.FORECAST_URL, params=params, timeout=self.timeout)
         response.raise_for_status()
         return response.json()

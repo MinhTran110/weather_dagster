@@ -1,8 +1,8 @@
-"""Dagster schedules for periodic execution of the weather pipeline."""
+"""Dagster schedules for periodic execution and partitioned backfills."""
 
 from dagster import (
     AssetSelection,
-    ScheduleDefinition,
+    build_schedule_from_partitioned_job,
     define_asset_job,
 )
 
@@ -10,14 +10,12 @@ from dagster import (
 weather_pipeline_job = define_asset_job(
     name="weather_pipeline_job",
     selection=AssetSelection.all(),
-    description="Job executing the full weather data pipeline (raw -> cleaned -> marts).",
+    description="Job executing the full partitioned weather pipeline (raw -> cleaned -> marts).",
 )
 
-# Daily schedule running at 06:00 AM (Asia/Ho_Chi_Minh) every day
-weather_daily_schedule = ScheduleDefinition(
-    name="weather_daily_schedule",
+# Daily schedule built from the partitioned job (runs daily at 06:00 AM Asia/Ho_Chi_Minh)
+weather_daily_schedule = build_schedule_from_partitioned_job(
     job=weather_pipeline_job,
-    cron_schedule="0 * * * *",
-    execution_timezone="Asia/Ho_Chi_Minh",
-    description="Daily schedule triggering the full weather data pipeline at 06:00 AM Vietnam time.",
+    name="weather_daily_schedule",
+    description="Daily schedule triggering the weather pipeline at 06:00 AM Asia/Ho_Chi_Minh.",
 )

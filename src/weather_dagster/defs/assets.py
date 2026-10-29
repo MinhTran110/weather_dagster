@@ -1,9 +1,15 @@
-"""Dagster 3-tier assets: raw -> cleaned -> marts with enterprise auditability."""
+"""Dagster 3-tier assets with daily partitioning for automatic schedules and backfills."""
 
 import json
 import uuid
 from datetime import datetime, timezone
-from dagster import AssetExecutionContext, MaterializeResult, MetadataValue, asset
+from dagster import (
+    AssetExecutionContext,
+    DailyPartitionsDefinition,
+    MaterializeResult,
+    MetadataValue,
+    asset,
+)
 from dagster_duckdb import DuckDBResource
 
 from weather_dagster.defs.client import OpenMeteoClient
@@ -14,16 +20,40 @@ DEFAULT_LAT = 21.0285
 DEFAULT_LON = 105.8542
 DATA_SOURCE = "open-meteo"
 
+# Daily partition definition starting from 2026-10-01, running at 06:00 AM Asia/Ho_Chi_Minh
+daily_partitions = DailyPartitionsDefinition(
+    start_date="2026-10-01",
+    hour_offset=6,
+    end_offset=1,
+    timezone="Asia/Ho_Chi_Minh",
+)
+
+
+def _get_partition_date(context: AssetExecutionContext) -> str:
+    """Helper to safely retrieve partition key or fallback to today's UTC date."""
+    if context.has_partition_key:
+        return context.partition_key
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
 
 @asset(
+    partitions_def=daily_partitions,
     group_name="raw",
-    description="Raw JSON forecast data from Open-Meteo with full audit trail and run lineage.",
+    description="Raw JSON weather forecast or historical data partitioned by date from Open-Meteo.",
 )
 def raw_weather(context: AssetExecutionContext, duckdb: DuckDBResource) -> MaterializeResult:
-    """Fetch raw weather data from Open-Meteo API and store in DuckDB raw_weather table."""
+    """Fetch raw weather data for the partition date and store in DuckDB raw_weather table."""
+    partition_date = _get_partition_date(context)
     client = OpenMeteoClient()
-    context.log.info(f"Fetching weather data from Open-Meteo for {DEFAULT_LOCATION}...")
-    payload = client.fetch_weather(latitude=DEFAULT_LAT, longitude=DEFAULT_LON)
+    context.log.info(f"Fetching weather data for {DEFAULT_LOCATION} on date {partition_date}...")
+
+    # Fetch data specifically for this partition date (24 hours)
+    payload = client.fetch_weather(
+        latitude=DEFAULT_LAT,
+        longitude=DEFAULT_LON,
+        start_date=partition_date,
+        end_date=partition_date,
+    )
 
     now = datetime.now(timezone.utc)
     batch_id = str(uuid.uuid4())
@@ -35,6 +65,7 @@ def raw_weather(context: AssetExecutionContext, duckdb: DuckDBResource) -> Mater
                 raw_id VARCHAR PRIMARY KEY,
                 source VARCHAR,
                 location_name VARCHAR,
+                partition_date VARCHAR,
                 latitude DOUBLE,
                 longitude DOUBLE,
                 dagster_run_id VARCHAR,
@@ -45,12 +76,13 @@ def raw_weather(context: AssetExecutionContext, duckdb: DuckDBResource) -> Mater
         )
         conn.execute(
             """
-            INSERT INTO raw_weather VALUES (?, ?, ?, ?, ?, ?, ?, ?);
+            INSERT INTO raw_weather VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
             """,
             [
                 batch_id,
                 DATA_SOURCE,
                 DEFAULT_LOCATION,
+                partition_date,
                 payload.get("latitude", DEFAULT_LAT),
                 payload.get("longitude", DEFAULT_LON),
                 context.run.run_id,
@@ -60,10 +92,11 @@ def raw_weather(context: AssetExecutionContext, duckdb: DuckDBResource) -> Mater
         )
         total_batches = conn.execute("SELECT COUNT(*) FROM raw_weather;").fetchone()[0]
 
-    context.log.info(f"Raw weather batch {batch_id} saved. Total batches: {total_batches}")
+    context.log.info(f"Raw weather batch {batch_id} saved for {partition_date}. Total batches: {total_batches}")
     return MaterializeResult(
         metadata={
             "raw_id": MetadataValue.text(batch_id),
+            "partition_date": MetadataValue.text(partition_date),
             "source": MetadataValue.text(DATA_SOURCE),
             "location_name": MetadataValue.text(DEFAULT_LOCATION),
             "total_raw_batches": MetadataValue.int(total_batches),
@@ -74,26 +107,41 @@ def raw_weather(context: AssetExecutionContext, duckdb: DuckDBResource) -> Mater
 
 @asset(
     deps=[raw_weather],
+    partitions_def=daily_partitions,
     group_name="cleaned",
-    description="Cleaned, unnested hourly weather metrics with composite primary key, source, and audit timestamps.",
+    description="Cleaned, unnested hourly weather metrics partitioned by date with audit timestamps.",
 )
 def cleaned_weather(context: AssetExecutionContext, duckdb: DuckDBResource) -> MaterializeResult:
-    """Parse and clean raw weather JSON into tabular cleaned_weather with created_at and updated_at."""
+    """Parse and clean raw weather JSON into tabular cleaned_weather for the partition date."""
+    partition_date = _get_partition_date(context)
     now = datetime.now(timezone.utc)
 
     with duckdb.get_connection() as conn:
-        # Retrieve the latest raw payload
+        # Retrieve the latest raw payload for this partition date
         row = conn.execute(
             """
             SELECT location_name, source, latitude, longitude, payload
             FROM raw_weather
+            WHERE partition_date = ?
             ORDER BY created_at DESC
             LIMIT 1;
-            """
+            """,
+            [partition_date],
         ).fetchone()
 
+        # Fallback if no specific partition row found
         if not row:
-            raise ValueError("No raw weather data found in raw_weather table.")
+            row = conn.execute(
+                """
+                SELECT location_name, source, latitude, longitude, payload
+                FROM raw_weather
+                ORDER BY created_at DESC
+                LIMIT 1;
+                """
+            ).fetchone()
+
+        if not row:
+            raise ValueError(f"No raw weather data found in raw_weather table for {partition_date}.")
 
         loc_name, src, lat, lon, payload_str = row
         raw_data = json.loads(payload_str)
@@ -172,16 +220,20 @@ def cleaned_weather(context: AssetExecutionContext, duckdb: DuckDBResource) -> M
 
         total_cleaned_rows = conn.execute("SELECT COUNT(*) FROM cleaned_weather;").fetchone()[0]
 
+        # Sample for Markdown preview table on Dagster UI
         sample_cleaned = conn.execute(
             """
             SELECT timestamp, temperature_2m, relative_humidity_2m, precipitation, wind_speed_10m
             FROM cleaned_weather
+            WHERE CAST(timestamp AS DATE) = CAST(? AS DATE)
             ORDER BY timestamp
             LIMIT 5;
-            """
+            """,
+            [partition_date],
         ).fetchall()
 
         md_cleaned = [
+            f"### Dữ liệu mẫu ngày {partition_date} ({loc_name})",
             "| Giờ (Timestamp) | Nhiệt độ (°C) | Độ ẩm (%) | Lượng mưa (mm) | Tốc độ gió (km/h) |",
             "|:---:|:---:|:---:|:---:|:---:|",
         ]
@@ -189,9 +241,10 @@ def cleaned_weather(context: AssetExecutionContext, duckdb: DuckDBResource) -> M
             md_cleaned.append(f"| {r[0]} | {r[1]} | {r[2]} | {r[3]} | {r[4]} |")
         cleaned_preview_md = "\n".join(md_cleaned)
 
-    context.log.info(f"Cleaned weather updated for {loc_name}. Total records in DB: {total_cleaned_rows}")
+    context.log.info(f"Cleaned weather updated for {loc_name} on {partition_date}. Total records in DB: {total_cleaned_rows}")
     return MaterializeResult(
         metadata={
+            "partition_date": MetadataValue.text(partition_date),
             "location_name": MetadataValue.text(loc_name),
             "processed_records": MetadataValue.int(len(cleaned_records)),
             "total_records": MetadataValue.int(total_cleaned_rows),
@@ -203,11 +256,13 @@ def cleaned_weather(context: AssetExecutionContext, duckdb: DuckDBResource) -> M
 
 @asset(
     deps=[cleaned_weather],
+    partitions_def=daily_partitions,
     group_name="marts",
-    description="Aggregated daily weather mart per location with audit timestamps and lineage.",
+    description="Aggregated daily weather mart partitioned by date with audit timestamps and lineage.",
 )
 def daily_weather_summary(context: AssetExecutionContext, duckdb: DuckDBResource) -> MaterializeResult:
-    """Aggregate cleaned weather data into daily summary marts table with created_at and updated_at."""
+    """Aggregate cleaned weather data into daily summary marts table for the partition date."""
+    partition_date = _get_partition_date(context)
     now = datetime.now(timezone.utc)
 
     with duckdb.get_connection() as conn:
@@ -230,7 +285,6 @@ def daily_weather_summary(context: AssetExecutionContext, duckdb: DuckDBResource
             """
         )
 
-        # Temporary table or direct aggregation
         conn.execute(
             """
             INSERT INTO daily_weather_summary
@@ -247,6 +301,7 @@ def daily_weather_summary(context: AssetExecutionContext, duckdb: DuckDBResource
                 ? AS created_at,
                 ? AS updated_at
             FROM cleaned_weather
+            WHERE CAST(timestamp AS DATE) = CAST(? AS DATE)
             GROUP BY location_name, CAST(timestamp AS DATE)
             ON CONFLICT (location_name, date) DO UPDATE SET
                 avg_temperature = EXCLUDED.avg_temperature,
@@ -258,7 +313,7 @@ def daily_weather_summary(context: AssetExecutionContext, duckdb: DuckDBResource
                 dagster_run_id = EXCLUDED.dagster_run_id,
                 updated_at = EXCLUDED.updated_at;
             """,
-            [context.run.run_id, now, now],
+            [context.run.run_id, now, now, partition_date],
         )
 
         total_days = conn.execute("SELECT COUNT(*) FROM daily_weather_summary;").fetchone()[0]
@@ -267,12 +322,13 @@ def daily_weather_summary(context: AssetExecutionContext, duckdb: DuckDBResource
             """
             SELECT date, min_temperature, max_temperature, avg_temperature, total_precipitation, avg_wind_speed
             FROM daily_weather_summary
-            ORDER BY date
+            ORDER BY date DESC
             LIMIT 7;
             """
         ).fetchall()
 
         md_summary = [
+            f"### Tổng hợp phân tích ngày {partition_date} & gần đây",
             "| Ngày | Min (°C) | Max (°C) | Trung bình (°C) | Lượng mưa (mm) | Gió (km/h) |",
             "|:---:|:---:|:---:|:---:|:---:|:---:|",
         ]
@@ -280,9 +336,10 @@ def daily_weather_summary(context: AssetExecutionContext, duckdb: DuckDBResource
             md_summary.append(f"| {r[0]} | {r[1]} | {r[2]} | {r[3]} | {r[4]} | {r[5]} |")
         forecast_preview_md = "\n".join(md_summary)
 
-    context.log.info(f"Daily weather mart updated. Total summary days: {total_days}")
+    context.log.info(f"Daily weather mart updated for {partition_date}. Total summary days: {total_days}")
     return MaterializeResult(
         metadata={
+            "partition_date": MetadataValue.text(partition_date),
             "total_days_summarized": MetadataValue.int(total_days),
             "dagster_run_id": MetadataValue.text(context.run.run_id or "manual"),
             "forecast_preview": MetadataValue.md(forecast_preview_md),
