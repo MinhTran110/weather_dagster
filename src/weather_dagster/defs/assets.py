@@ -72,11 +72,14 @@ def raw_weather(context: AssetExecutionContext, duckdb: DuckDBResource) -> Mater
                 created_at TIMESTAMP,
                 payload VARCHAR
             );
+            ALTER TABLE raw_weather ADD COLUMN IF NOT EXISTS partition_date VARCHAR;
             """
         )
         conn.execute(
             """
-            INSERT INTO raw_weather VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
+            INSERT INTO raw_weather (
+                raw_id, source, location_name, partition_date, latitude, longitude, dagster_run_id, created_at, payload
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
             """,
             [
                 batch_id,
