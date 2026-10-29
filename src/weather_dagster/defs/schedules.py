@@ -17,7 +17,7 @@ weather_pipeline_job = define_asset_job(
 weather_daily_schedule = ScheduleDefinition(
     name="weather_daily_schedule",
     job=weather_pipeline_job,
-    cron_schedule="0 6 * * *",
+    cron_schedule="0 * * * *",
     execution_timezone="Asia/Ho_Chi_Minh",
     description="Daily schedule triggering the full weather data pipeline at 06:00 AM Vietnam time.",
 )
