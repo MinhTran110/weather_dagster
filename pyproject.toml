@@ -1,0 +1,29 @@
+[project]
+name = "weather_dagster"
+version = "0.1.0"
+description = "Weather data pipeline using Dagster, DuckDB, and Open-Meteo REST API"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "dagster>=1.8.0",
+    "dagster-duckdb>=0.24.0",
+    "duckdb>=1.0.0",
+    "requests>=2.31.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "dagster-webserver>=1.8.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.dagster]
+module_name = "weather_dagster.definitions"
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
