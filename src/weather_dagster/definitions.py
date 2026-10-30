@@ -5,6 +5,7 @@ from dagster import Definitions
 from weather_dagster.defs.assets import (
     cleaned_weather,
     daily_weather_summary,
+    open_meteo_api,
     raw_weather,
 )
 from weather_dagster.defs.checks import (
@@ -19,6 +20,7 @@ from weather_dagster.defs.schedules import (
 
 defs = Definitions(
     assets=[
+        open_meteo_api,
         raw_weather,
         cleaned_weather,
         daily_weather_summary,

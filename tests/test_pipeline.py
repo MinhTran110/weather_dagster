@@ -55,6 +55,7 @@ def test_pipeline_definitions():
     assert asset_graph is not None
 
     asset_keys = {key.path[-1] for key in asset_graph.get_all_asset_keys()}
+    assert "open_meteo_api" in asset_keys
     assert "raw_weather" in asset_keys
     assert "cleaned_weather" in asset_keys
     assert "daily_weather_summary" in asset_keys

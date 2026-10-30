@@ -1,13 +1,16 @@
-"""Dagster 3-tier assets with daily partitioning for automatic schedules and backfills."""
+"""Dagster 3-tier assets with daily partitioning, visual lineage, and table schemas."""
 
 import json
 import uuid
 from datetime import datetime, timezone
 from dagster import (
     AssetExecutionContext,
+    AssetSpec,
     DailyPartitionsDefinition,
     MaterializeResult,
     MetadataValue,
+    TableColumn,
+    TableSchema,
     asset,
 )
 from dagster_duckdb import DuckDBResource
@@ -19,6 +22,69 @@ DEFAULT_LOCATION = "Hanoi"
 DEFAULT_LAT = 21.0285
 DEFAULT_LON = 105.8542
 DATA_SOURCE = "open-meteo"
+DB_FILE_PATH = "data/weather.duckdb"
+
+# 1. External Source Asset representing Open-Meteo REST API
+open_meteo_api = AssetSpec(
+    key="open_meteo_api",
+    description="Open-Meteo Global Weather REST API (https://api.open-meteo.com/v1/forecast).",
+    kinds={"api", "rest"},
+    group_name="sources",
+    metadata={
+        "endpoint": MetadataValue.url("https://api.open-meteo.com/v1/forecast"),
+        "provider": MetadataValue.text("Open-Meteo"),
+        "auth_type": MetadataValue.text("Public (No API Key Required)"),
+        "rate_limit": MetadataValue.text("10,000 calls / day"),
+    },
+)
+
+# 2. Database Table Schemas for Rich Display on Dagster UI
+RAW_WEATHER_SCHEMA = TableSchema(
+    columns=[
+        TableColumn("raw_id", "VARCHAR", description="UUID định danh duy nhất cho từng batch cào"),
+        TableColumn("source", "VARCHAR", description="Nguồn dữ liệu gốc (open-meteo)"),
+        TableColumn("location_name", "VARCHAR", description="Tên địa điểm (Hanoi)"),
+        TableColumn("partition_date", "VARCHAR", description="Ngày phân vùng (YYYY-MM-DD)"),
+        TableColumn("latitude", "DOUBLE", description="Vĩ độ"),
+        TableColumn("longitude", "DOUBLE", description="Kinh độ"),
+        TableColumn("dagster_run_id", "VARCHAR", description="Mã Run ID của Dagster thực thi"),
+        TableColumn("created_at", "TIMESTAMP", description="Thời điểm ghi nhận dữ liệu vào DB (UTC)"),
+        TableColumn("payload", "VARCHAR", description="Chuỗi JSON thô nguyên bản từ Open-Meteo API"),
+    ]
+)
+
+CLEANED_WEATHER_SCHEMA = TableSchema(
+    columns=[
+        TableColumn("location_name", "VARCHAR", description="Tên địa điểm (Khóa chính kết hợp)"),
+        TableColumn("timestamp", "TIMESTAMP", description="Mốc thời gian đo theo giờ (Khóa chính kết hợp)"),
+        TableColumn("temperature_2m", "DOUBLE", description="Nhiệt độ không khí ở độ cao 2m (°C)"),
+        TableColumn("relative_humidity_2m", "DOUBLE", description="Độ ẩm không khí tương đối (%)"),
+        TableColumn("precipitation", "DOUBLE", description="Lượng mưa tích lũy trong giờ (mm)"),
+        TableColumn("wind_speed_10m", "DOUBLE", description="Tốc độ gió ở độ cao 10m (km/h)"),
+        TableColumn("source", "VARCHAR", description="Nguồn dữ liệu gốc (open-meteo)"),
+        TableColumn("latitude", "DOUBLE", description="Vĩ độ"),
+        TableColumn("longitude", "DOUBLE", description="Kinh độ"),
+        TableColumn("dagster_run_id", "VARCHAR", description="Mã Run ID cập nhật gần nhất"),
+        TableColumn("created_at", "TIMESTAMP", description="Thời điểm bản ghi được tạo lần đầu"),
+        TableColumn("updated_at", "TIMESTAMP", description="Thời điểm bản ghi được cập nhật mới nhất"),
+    ]
+)
+
+DAILY_SUMMARY_SCHEMA = TableSchema(
+    columns=[
+        TableColumn("location_name", "VARCHAR", description="Tên địa điểm (Khóa chính kết hợp)"),
+        TableColumn("date", "DATE", description="Ngày tổng hợp (Khóa chính kết hợp)"),
+        TableColumn("avg_temperature", "DOUBLE", description="Nhiệt độ trung bình trong ngày (°C)"),
+        TableColumn("min_temperature", "DOUBLE", description="Nhiệt độ thấp nhất trong ngày (°C)"),
+        TableColumn("max_temperature", "DOUBLE", description="Nhiệt độ cao nhất trong ngày (°C)"),
+        TableColumn("total_precipitation", "DOUBLE", description="Tổng lượng mưa tích lũy cả ngày (mm)"),
+        TableColumn("avg_wind_speed", "DOUBLE", description="Tốc độ gió trung bình cả ngày (km/h)"),
+        TableColumn("record_count", "BIGINT", description="Số giờ đo được tổng hợp (thường là 24 giờ)"),
+        TableColumn("dagster_run_id", "VARCHAR", description="Mã Run ID cập nhật gần nhất"),
+        TableColumn("created_at", "TIMESTAMP", description="Thời điểm bản ghi được tạo lần đầu"),
+        TableColumn("updated_at", "TIMESTAMP", description="Thời điểm bản ghi được cập nhật mới nhất"),
+    ]
+)
 
 # Daily partition definition starting from 2026-10-01, running at 06:00 AM Asia/Ho_Chi_Minh
 daily_partitions = DailyPartitionsDefinition(
@@ -37,9 +103,11 @@ def _get_partition_date(context: AssetExecutionContext) -> str:
 
 
 @asset(
+    deps=[open_meteo_api],
     partitions_def=daily_partitions,
+    kinds={"duckdb", "python"},
     group_name="raw",
-    description="Raw JSON weather forecast or historical data partitioned by date from Open-Meteo.",
+    description="Raw JSON weather forecast or historical data partitioned by date from Open-Meteo into DuckDB.",
 )
 def raw_weather(context: AssetExecutionContext, duckdb: DuckDBResource) -> MaterializeResult:
     """Fetch raw weather data for the partition date and store in DuckDB raw_weather table."""
@@ -98,6 +166,9 @@ def raw_weather(context: AssetExecutionContext, duckdb: DuckDBResource) -> Mater
     context.log.info(f"Raw weather batch {batch_id} saved for {partition_date}. Total batches: {total_batches}")
     return MaterializeResult(
         metadata={
+            "dagster/table_name": MetadataValue.text("raw_weather"),
+            "dagster/column_schema": MetadataValue.table_schema(RAW_WEATHER_SCHEMA),
+            "database_file": MetadataValue.path(DB_FILE_PATH),
             "raw_id": MetadataValue.text(batch_id),
             "partition_date": MetadataValue.text(partition_date),
             "source": MetadataValue.text(DATA_SOURCE),
@@ -111,8 +182,9 @@ def raw_weather(context: AssetExecutionContext, duckdb: DuckDBResource) -> Mater
 @asset(
     deps=[raw_weather],
     partitions_def=daily_partitions,
+    kinds={"duckdb", "sql"},
     group_name="cleaned",
-    description="Cleaned, unnested hourly weather metrics partitioned by date with audit timestamps.",
+    description="Cleaned, unnested hourly weather metrics partitioned by date with audit timestamps in DuckDB.",
 )
 def cleaned_weather(context: AssetExecutionContext, duckdb: DuckDBResource) -> MaterializeResult:
     """Parse and clean raw weather JSON into tabular cleaned_weather for the partition date."""
@@ -247,6 +319,9 @@ def cleaned_weather(context: AssetExecutionContext, duckdb: DuckDBResource) -> M
     context.log.info(f"Cleaned weather updated for {loc_name} on {partition_date}. Total records in DB: {total_cleaned_rows}")
     return MaterializeResult(
         metadata={
+            "dagster/table_name": MetadataValue.text("cleaned_weather"),
+            "dagster/column_schema": MetadataValue.table_schema(CLEANED_WEATHER_SCHEMA),
+            "database_file": MetadataValue.path(DB_FILE_PATH),
             "partition_date": MetadataValue.text(partition_date),
             "location_name": MetadataValue.text(loc_name),
             "processed_records": MetadataValue.int(len(cleaned_records)),
@@ -260,8 +335,9 @@ def cleaned_weather(context: AssetExecutionContext, duckdb: DuckDBResource) -> M
 @asset(
     deps=[cleaned_weather],
     partitions_def=daily_partitions,
+    kinds={"duckdb", "sql"},
     group_name="marts",
-    description="Aggregated daily weather mart partitioned by date with audit timestamps and lineage.",
+    description="Aggregated daily weather mart partitioned by date with audit timestamps and lineage in DuckDB.",
 )
 def daily_weather_summary(context: AssetExecutionContext, duckdb: DuckDBResource) -> MaterializeResult:
     """Aggregate cleaned weather data into daily summary marts table for the partition date."""
@@ -342,6 +418,9 @@ def daily_weather_summary(context: AssetExecutionContext, duckdb: DuckDBResource
     context.log.info(f"Daily weather mart updated for {partition_date}. Total summary days: {total_days}")
     return MaterializeResult(
         metadata={
+            "dagster/table_name": MetadataValue.text("daily_weather_summary"),
+            "dagster/column_schema": MetadataValue.table_schema(DAILY_SUMMARY_SCHEMA),
+            "database_file": MetadataValue.path(DB_FILE_PATH),
             "partition_date": MetadataValue.text(partition_date),
             "total_days_summarized": MetadataValue.int(total_days),
             "dagster_run_id": MetadataValue.text(context.run.run_id or "manual"),
